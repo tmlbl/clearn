@@ -34,9 +34,15 @@ struct bplus_node *bplus_node_create(int is_leaf) {
     node->num_keys = 0;
     node->is_leaf = is_leaf;
     node->next = NULL;
+    node->buffer_position = 0;
 
     for (int i = 0; i < MAX_CHILDREN; i++) {
         node->children[i] = NULL;
+    }
+
+    if (!is_leaf) {
+        // add child for keys greater than max split key
+        node->children[0] = bplus_node_create(1);
     }
 
     return node;
@@ -57,9 +63,6 @@ int bplus_node_can_fit(struct bplus_node *node, int key_len, int val_len) {
         return 0;
     }
 
-    printf("slots used: %d/%d\n", node->num_keys, MAX_KEYS);
-    printf("data used: %d/%d\n", node->buffer_position, NODE_BUFFER_SIZE);
-
     return 1;
 }
 
@@ -68,8 +71,8 @@ struct bplus_insert_index {
     int found;
 };
 
-struct bplus_insert_index bplus_node_find_insert_index(
-    struct bplus_node *node, int key_len, char *key, int val_len, char *val) {
+struct bplus_insert_index
+bplus_node_find_insert_index(struct bplus_node *node, int key_len, char *key) {
 
     struct bplus_insert_index ret = {0};
 
@@ -87,11 +90,11 @@ struct bplus_insert_index bplus_node_find_insert_index(
 
         // search forward until our key is less than their key
         int cmp = memcmp(key, stored_key, compare_len);
-        if (cmp == 0) {
+        if (cmp == 0 && key_len == node->key_lengths[i]) {
             ret.found = 1;
             ret.pos = i;
             return ret;
-        } else if (cmp < 0) {
+        } else if (cmp < 0 || (cmp == 0 && key_len != node->key_lengths[i])) {
             ret.pos = i;
             return ret;
         }
@@ -161,7 +164,41 @@ struct bplus_node *bplus_node_split_leaf(struct bplus_node *full_node) {
     new_node->next = full_node->next;
     full_node->next = new_node;
 
+    printf("split node %p to create %p\n", full_node, new_node);
+
     return new_node;
+}
+
+void bplus_node_add_child(struct bplus_node *node, struct bplus_node *child) {
+    assert(!node->is_leaf);
+    assert(child->is_leaf);
+
+    char *child_key = &child->buf[child->key_offsets[child->num_keys - 1]];
+    int child_key_len = child->key_lengths[child->num_keys - 1];
+
+    if (!bplus_node_can_fit(node, child_key_len, 0)) {
+        printf("internal node full - not implemented!!!\n");
+        exit(1);
+    }
+
+    struct bplus_insert_index index =
+        bplus_node_find_insert_index(node, child_key_len, child_key);
+
+    // shift children
+    for (int i = node->num_keys + 1; i > index.pos; i--) {
+        node->children[i] = node->children[i - 1];
+    }
+
+    // insert key
+    bplus_node_insert_at(node, index, child_key_len, child_key, 0, "");
+
+    // insert child
+    node->children[index.pos] = child;
+
+    // fix pointers
+    for (int i = 0; i < node->num_keys; i++) {
+        node->children[i]->next = node->children[i + 1];
+    }
 }
 
 struct bplus_node *
@@ -169,11 +206,13 @@ bplus_node_insert(struct bplus_node *node, char *key, char *value) {
     int key_len = strlen(key);
     int val_len = strlen(value);
 
+    printf("insert (%s => %s) into node %p\n", key, value, node);
+
     if (node->is_leaf) {
         if (bplus_node_can_fit(node, key_len, val_len)) {
             // normal insert
-            struct bplus_insert_index index = bplus_node_find_insert_index(
-                node, key_len, key, val_len, value);
+            struct bplus_insert_index index =
+                bplus_node_find_insert_index(node, key_len, key);
             printf("inserting %s at %d\n", key, index.pos);
             bplus_node_insert_at(node, index, key_len, key, val_len, value);
 
@@ -184,37 +223,76 @@ bplus_node_insert(struct bplus_node *node, char *key, char *value) {
             struct bplus_node *new_node = bplus_node_split_leaf(node);
 
             // compare this key to split key to decide which node to insert to
-            //
+            char *split_key = &new_node->buf[new_node->key_offsets[0]];
+            int compare_len = new_node->key_lengths[0];
+            if (key_len < compare_len) {
+                compare_len = key_len;
+            }
+
             // insert to the correct node
+            if (memcmp(key, split_key, compare_len) < 0) {
+                bplus_node_insert(node, key, value);
+            } else {
+                bplus_node_insert(new_node, key, value);
+            }
 
             return new_node;
         }
     } else {
         // internal node
         // reuse bplus_node_find_insert_index to find split key of correct child
+        struct bplus_insert_index index =
+            bplus_node_find_insert_index(node, key_len, key);
+
         // insert to that child, test if it split
+        struct bplus_node *new_node =
+            bplus_node_insert(node->children[index.pos], key, value);
+
         //     if it split, add new child to this internal node
-        //     if this internal node is full, split the internal node
+        if (new_node != NULL) {
+            bplus_node_add_child(node, new_node);
+        }
     }
 
     return NULL;
 }
 
 void bplus_tree_insert(struct bplus_tree *tree, char *key, char *val) {
-    // TODO: determine whether to convert root to internal node after split
-    bplus_node_insert(tree->root, key, val);
+    struct bplus_node *new_node = bplus_node_insert(tree->root, key, val);
+    if (new_node != NULL) {
+        // increase tree height
+        struct bplus_node *new_root = bplus_node_create(0);
+        bplus_node_add_child(new_root, tree->root);
+        bplus_node_add_child(new_root, new_node);
+
+        tree->root = new_root;
+        tree->height += 1;
+    }
 }
 
-void bplus_tree_print_keys(struct bplus_tree *tree) {
-    struct bplus_node *root = tree->root;
-
-    for (int i = 0; i < root->num_keys; i++) {
-        printf(
-            "key: %.*s ", root->key_lengths[i],
-            &root->buf[root->key_offsets[i]]);
-        printf(
-            "value: %.*s\n", root->value_lengths[i],
-            &root->buf[root->value_offsets[i]]);
+void bplus_node_print_keys(struct bplus_node *node) {
+    if (node->is_leaf) {
+        printf("leaf node %p\n", node);
+        for (int i = 0; i < node->num_keys; i++) {
+            printf(
+                "key: %.*s ", node->key_lengths[i],
+                &node->buf[node->key_offsets[i]]);
+            printf(
+                "value: %.*s\n", node->value_lengths[i],
+                &node->buf[node->value_offsets[i]]);
+        }
+        if (node->next != NULL) {
+            bplus_node_print_keys(node->next);
+        }
+    } else {
+        printf("internal node %p split keys: ", node);
+        for (int i = 0; i < node->num_keys; i++) {
+            printf(
+                "%d=%.*s ", i, node->key_lengths[i],
+                &node->buf[node->key_offsets[i]]);
+        }
+        printf("\n");
+        bplus_node_print_keys(node->children[0]);
     }
 }
 
@@ -240,7 +318,13 @@ int main(int argc, char *argv[]) {
     // this is one too many
     bplus_tree_insert(tree, "straw", "camel's back");
 
-    bplus_tree_print_keys(tree);
+    // now we are calling insert when our root is an internal node
+    bplus_tree_insert(tree, "internal", "node");
+
+    // our final split key is zoo, what if we add something greater?
+    bplus_tree_insert(tree, "zzz", "end");
+
+    bplus_node_print_keys(tree->root);
 
     bplus_tree_destroy(tree);
     return 0;
