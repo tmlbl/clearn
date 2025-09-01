@@ -270,6 +270,29 @@ void bplus_tree_insert(struct bplus_tree *tree, char *key, char *val) {
     }
 }
 
+int bplus_node_get(struct bplus_node *node, char *key, char *buf, int buf_len) {
+    struct bplus_insert_index index =
+        bplus_node_find_insert_index(node, strlen(key), key);
+
+    if (!node->is_leaf) {
+        return bplus_node_get(node->children[index.pos], key, buf, buf_len);
+    } else if (!index.found) {
+        return 1;
+    } else {
+        int val_len = node->value_lengths[index.pos];
+        if (buf_len < (val_len + 1)) {
+            printf("buffer too small!\n");
+            return -1;
+        }
+
+        char *val = &node->buf[node->value_offsets[index.pos]];
+        memcpy(buf, val, val_len);
+        buf[val_len] = '\0';
+    }
+
+    return 0;
+}
+
 void bplus_node_print_keys(struct bplus_node *node) {
     if (node->is_leaf) {
         printf("leaf node %p\n", node);
@@ -325,6 +348,11 @@ int main(int argc, char *argv[]) {
     bplus_tree_insert(tree, "zzz", "end");
 
     bplus_node_print_keys(tree->root);
+
+    // let's read our index!
+    char buf[128];
+    bplus_node_get(tree->root, "foo", &buf[0], 128);
+    printf("query result: foo == %s\n", buf);
 
     bplus_tree_destroy(tree);
     return 0;
